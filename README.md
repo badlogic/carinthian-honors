@@ -69,6 +69,71 @@ Output: `veranstaltungen_YYYY_extracted.json`
 **Included:** Ehrenzeichen, Verdienstzeichen, Orden, Medaillen, Ehrenkreuze  
 **Excluded:** Berufstitel (Hofrat, Schulrat, etc.), diplomas, certifications
 
+### Step 4: Generate reports
+
+```bash
+node generate-reports.js veranstaltungen_*_extracted.json
+```
+
+Merges multiple extracted JSON files and generates:
+- `ehrungen_merged.json` - all entries combined
+- `ehrungen_persons.json` - flattened list of all honored persons
+- `ehrungen.csv` - Excel-compatible CSV
+- `ehrungen_dashboard.html` - interactive dashboard (Tailwind + Chart.js)
+
+## Data Formats
+
+### veranstaltungen_YYYY.json (after Step 1)
+
+```json
+[
+  { "url": "https://...", "title": "Event title" }
+]
+```
+
+### veranstaltungen_YYYY.json (after Step 2)
+
+```json
+[
+  { "url": "https://...", "title": "Event title", "content": "Full page text..." }
+]
+```
+
+### veranstaltungen_YYYY_extracted.json (after Step 3)
+
+```json
+[
+  {
+    "url": "https://...",
+    "title": "Event title",
+    "content": "Full page text...",
+    "isEhrung": true,
+    "persons": [
+      { "name": "Maria Müller", "gender": "female", "honor": "Großes Goldenes Ehrenzeichen" }
+    ]
+  }
+]
+```
+
+### ehrungen_persons.json (after Step 4)
+
+Flattened list with year extracted from filename:
+
+```json
+[
+  {
+    "name": "Maria Müller",
+    "gender": "female",
+    "honor": "Großes Goldenes Ehrenzeichen",
+    "url": "https://...",
+    "year": "2025"
+  }
+]
+```
+
+**Included honors:** Ehrenzeichen, Verdienstzeichen, Orden, Medaillen, Ehrenkreuze  
+**Excluded:** Berufstitel (Hofrat, Schulrat, etc.), diplomas, certifications
+
 ## Quick Stats
 
 ```bash
