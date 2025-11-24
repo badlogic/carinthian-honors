@@ -6,29 +6,53 @@ const RESET = '\x1b[0m';
 const YELLOW = '\x1b[33m';
 const GREEN = '\x1b[32m';
 const RED = '\x1b[31m';
+const DIM = '\x1b[2m';
 
-function runPi(promptFile) {
+function runPi(prompt) {
     return new Promise((resolve, reject) => {
-        const proc = spawn('pi', ['-p', `$(cat ${promptFile})`], {
-            shell: true,
+        // Write prompt to a temp file and use shell to read it
+        const promptFile = '/tmp/pi_prompt_cmd.txt';
+        writeFileSync(promptFile, prompt);
+        
+        const proc = spawn('bash', ['-c', `pi --mode json -p "$(cat ${promptFile})"`], {
             timeout: 600000 // 10 min
         });
         
+        let buffer = '';
+        let lastTextContent = '';
+        
         proc.stdout.on('data', (data) => {
-            const lines = data.toString().split('\n');
-            lines.forEach(line => {
-                if (line) console.log(`${CYAN}[pi] ${line}${RESET}`);
-            });
+            buffer += data.toString();
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // Keep incomplete line in buffer
+            
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const event = JSON.parse(line);
+                    handlePiEvent(event, (text) => {
+                        // Only log new text content
+                        if (text !== lastTextContent) {
+                            const newText = text.slice(lastTextContent.length);
+                            if (newText) {
+                                process.stdout.write(`${CYAN}${newText}${RESET}`);
+                            }
+                            lastTextContent = text;
+                        }
+                    });
+                } catch (e) {
+                    // Not JSON, just log it
+                    console.log(`${DIM}[pi] ${line}${RESET}`);
+                }
+            }
         });
         
         proc.stderr.on('data', (data) => {
-            const lines = data.toString().split('\n');
-            lines.forEach(line => {
-                if (line) console.log(`${CYAN}[pi] ${line}${RESET}`);
-            });
+            process.stderr.write(`${DIM}${data}${RESET}`);
         });
         
         proc.on('close', (code) => {
+            if (lastTextContent) console.log(); // Newline after streaming
             if (code === 0) {
                 resolve();
             } else {
@@ -42,20 +66,74 @@ function runPi(promptFile) {
     });
 }
 
-const BATCH_SIZE = 20;
+function handlePiEvent(event, onText) {
+    switch (event.type) {
+        case 'agent_start':
+            console.log(`${DIM}[pi] Agent started${RESET}`);
+            break;
+        case 'agent_end':
+            console.log(`${DIM}[pi] Agent finished${RESET}`);
+            break;
+        case 'turn_start':
+            break;
+        case 'turn_end':
+            break;
+        case 'message_start':
+            if (event.message?.role === 'assistant') {
+                process.stdout.write(`${CYAN}[pi] `);
+            } else if (event.message?.role === 'user') {
+                // Log user message
+                const content = event.message?.content;
+                if (typeof content === 'string') {
+                    console.log(`${YELLOW}[user] ${content.substring(0, 200)}${content.length > 200 ? '...' : ''}${RESET}`);
+                } else if (Array.isArray(content)) {
+                    const text = content.filter(p => p.type === 'text').map(p => p.text).join('');
+                    console.log(`${YELLOW}[user] ${text.substring(0, 200)}${text.length > 200 ? '...' : ''}${RESET}`);
+                }
+            }
+            break;
+        case 'message_update':
+            // Extract text from assistant message
+            if (event.message?.role === 'assistant' && event.message?.content) {
+                const textParts = event.message.content
+                    .filter(p => p.type === 'text')
+                    .map(p => p.text)
+                    .join('');
+                onText(textParts);
+            }
+            break;
+        case 'message_end':
+            break;
+        case 'tool_execution_start':
+            console.log(`${DIM}[pi] Tool: ${event.toolName}${RESET}`);
+            break;
+        case 'tool_execution_end':
+            if (event.isError) {
+                console.log(`${RED}[pi] Tool error: ${event.toolName}${RESET}`);
+            }
+            break;
+    }
+}
+
+const BATCH_SIZE = 5;
 const MAX_RETRIES = 3;
 
-function validateResult(result) {
+function validateResult(result, expectedUrls) {
     if (!Array.isArray(result)) {
         return { valid: false, error: 'Result is not an array' };
     }
+    
+    // Check that we got all expected URLs
+    const resultUrls = new Set(result.map(r => r.url));
+    const missingUrls = expectedUrls.filter(url => !resultUrls.has(url));
+    if (missingUrls.length > 0) {
+        return { valid: false, error: `Missing ${missingUrls.length} URLs in output: ${missingUrls[0]}...` };
+    }
+    
     for (let i = 0; i < result.length; i++) {
         const entry = result[i];
         if (typeof entry.url !== 'string') {
             return { valid: false, error: `Entry ${i}: missing or invalid 'url'` };
-        }
-        if (typeof entry.title !== 'string') {
-            return { valid: false, error: `Entry ${i}: missing or invalid 'title'` };
         }
         if (typeof entry.isEhrung !== 'boolean') {
             return { valid: false, error: `Entry ${i}: missing or invalid 'isEhrung' (must be boolean)` };
@@ -89,7 +167,6 @@ async function main() {
     }
 
     const outputFile = inputFile.replace('.json', '_extracted.json');
-    const processedFile = inputFile.replace('.json', '_processed_urls.json');
     
     const data = JSON.parse(readFileSync(inputFile, 'utf-8'));
     console.log(`${YELLOW}Loaded ${data.length} entries from ${inputFile}${RESET}`);
@@ -101,14 +178,8 @@ async function main() {
         console.log(`Loaded ${existing.length} existing results from ${outputFile}`);
     }
     
-    // Load processed URLs (includes URLs that had no honorees)
-    let processedUrls = new Set();
-    if (existsSync(processedFile)) {
-        processedUrls = new Set(JSON.parse(readFileSync(processedFile, 'utf-8')));
-        console.log(`Loaded ${processedUrls.size} processed URLs from ${processedFile}`);
-    }
-    
-    // Filter out already processed
+    // Filter out already processed (URLs already in extracted.json)
+    const processedUrls = new Set(existing.map(e => e.url));
     const remaining = data.filter(e => !processedUrls.has(e.url));
     console.log(`${remaining.length} entries remaining (${existing.length} already processed)`);
     
@@ -139,17 +210,28 @@ async function main() {
         
         const prompt = `You are analyzing government press releases from Kärnten, Austria to extract information about honorary awards ("Ehrungen" / "Auszeichnungen").
 
-Read the JSON file at ${tempInputFile}. It contains an array of entries with url, title, and content.
+IMPORTANT: The data is provided inline below. DO NOT use the read tool - it truncates long lines. All data you need is already in this prompt.
 
-For EACH entry, determine:
-1. Is this about an honorary award/recognition being given to specific people? (Not just announcements about award programs, but actual ceremonies where named individuals receive honors)
+=== JSON DATA TO ANALYZE ===
+
+${JSON.stringify(batchData, null, 2)}
+
+=== INSTRUCTIONS ===
+
+For EACH entry above, you must:
+1. Determine if this is about an honorary award/recognition being given to specific named people
 2. If yes, extract ALL persons who received an honor/award/recognition
 
-Write your results to ${tempOutputFile} as a JSON array with this EXACT format:
+THINK OUT LOUD for each entry:
+- First, identify if the article is about an award ceremony
+- If yes, list EVERY person mentioned who received an award
+- Count them to make sure you didn't miss anyone (titles often say "X Personen ausgezeichnet" - verify your count matches!)
+- Note the specific award each person received
+
+Then write your results to ${tempOutputFile} as a JSON array with this EXACT format:
 [
   {
     "url": "the original url",
-    "title": "the original title", 
     "isEhrung": true or false,
     "persons": [
       {
@@ -161,17 +243,23 @@ Write your results to ${tempOutputFile} as a JSON array with this EXACT format:
   }
 ]
 
-IMPORTANT:
-- Only include entries where isEhrung is TRUE and persons array is NOT empty
-- Skip entries that are about award programs in general without naming recipients
-- Skip entries where politicians are just attending/presenting (they are NOT the honorees)
-- Extract the ACTUAL honor/award name, not generic descriptions
+CRITICAL RULES:
+- Include ALL entries from the input, even if isEhrung is false (set persons to empty array [])
+- Politicians presenting awards are NOT honorees - only extract the RECIPIENTS
+- Extract the ACTUAL award name, not generic descriptions
 - Names should be clean: "Maria Müller" not "Frau Mag. Dr. Maria Müller"
-- Determine gender from context (titles like "Frau", names, pronouns used)
+- Determine gender from context (titles like "Frau", names, pronouns)
 - If multiple people receive the same honor, list each separately
 - If one person receives multiple honors, list them once with the most significant honor
+- READ THE ENTIRE CONTENT - some articles mention 7+ people, extract ALL of them
+- Look for: "wurde ausgezeichnet", "erhielt", "überreichte", "wurde gewürdigt", "bekam", "ging an"
+- Berufstitel (like Hofrat, Schulrat, Oberstudienrat, etc.) are NOT honorary awards - skip these entirely
+- Only include actual Ehrenzeichen, Verdienstzeichen, Orden, Medaillen, Ehrenkreuze, etc.
 
-Write ONLY the JSON array to ${tempOutputFile}, nothing else.`;
+After writing the file, run: node validate-output.js ${tempOutputFile}
+If validation fails, fix the JSON and try again until it passes.
+
+Write ONLY valid JSON to ${tempOutputFile}, no markdown formatting.`;
 
         // Log the titles we're processing
         console.log('Entries in this batch:');
@@ -179,9 +267,10 @@ Write ONLY the JSON array to ${tempOutputFile}, nothing else.`;
             console.log(`  ${idx + 1}. ${e.title.substring(0, 80)}...`);
         });
         
-        // Write prompt to temp file for pi to read
+        // Write full prompt to temp file
         const tempPromptFile = '/tmp/ehrungen_prompt.txt';
         writeFileSync(tempPromptFile, prompt);
+        const wrappedPrompt = `Use cat to read the file ${tempPromptFile} and then execute the instructions contained within it. Do NOT use the read tool as it truncates content.`;
         
         console.log(`\nInput: ${tempInputFile}`);
         console.log(`Output will be: ${tempOutputFile}`);
@@ -197,7 +286,7 @@ Write ONLY the JSON array to ${tempOutputFile}, nothing else.`;
                     writeFileSync(tempOutputFile, '');
                 }
                 
-                await runPi(tempPromptFile);
+                await runPi(wrappedPrompt);
                 
                 // Read and validate results
                 if (!existsSync(tempOutputFile)) {
@@ -222,7 +311,8 @@ Write ONLY the JSON array to ${tempOutputFile}, nothing else.`;
                     continue;
                 }
                 
-                const validation = validateResult(parsed);
+                const expectedUrls = batchData.map(e => e.url);
+                const validation = validateResult(parsed, expectedUrls);
                 if (!validation.valid) {
                     console.error(`Validation failed: ${validation.error}`);
                     console.log('Retrying...');
@@ -248,41 +338,34 @@ Write ONLY the JSON array to ${tempOutputFile}, nothing else.`;
             continue;
         }
         
-        const validResults = batchResults.filter(r => r.isEhrung && r.persons && r.persons.length > 0);
-        
-        // Add full content from original data
-        const urlToContent = new Map(batch.map(e => [e.url, e.content]));
-        validResults.forEach(r => {
-            r.content = urlToContent.get(r.url) || '';
+        // Add title and content from original data to ALL results
+        const urlToData = new Map(batch.map(e => [e.url, { title: e.title, content: e.content }]));
+        batchResults.forEach(r => {
+            const orig = urlToData.get(r.url) || {};
+            r.title = orig.title || '';
+            r.content = orig.content || '';
         });
         
-        console.log(`\nBatch ${batchNum} results:`);
-        validResults.forEach(r => {
+        const ehrungen = batchResults.filter(r => r.isEhrung && r.persons && r.persons.length > 0);
+        
+        console.log(`\nBatch ${batchNum} results: ${ehrungen.length} Ehrungen found`);
+        ehrungen.forEach(r => {
             console.log(`  ${r.title.substring(0, 60)}...`);
             r.persons.forEach(p => {
                 console.log(`    - ${p.name} (${p.gender}): ${p.honor}`);
             });
         });
         
-        // Mark all URLs in batch as processed
-        batchResults.forEach(r => processedUrls.add(r.url));
+        // Add ALL results to existing (so we know what's been processed)
+        existing = existing.concat(batchResults);
         
-        // Add valid results to existing
-        existing = existing.concat(validResults);
-        
-        // Atomic writes: write to temp files first, then rename
+        // Atomic write: write to temp file first, then rename
         const tempOutputFile2 = outputFile + '.tmp';
-        const tempProcessedFile = processedFile + '.tmp';
-        
         writeFileSync(tempOutputFile2, JSON.stringify(existing, null, 2));
-        writeFileSync(tempProcessedFile, JSON.stringify([...processedUrls], null, 2));
-        
-        // Rename (atomic on most filesystems)
         renameSync(tempOutputFile2, outputFile);
-        renameSync(tempProcessedFile, processedFile);
         
-        console.log(`${GREEN}\nBatch ${batchNum}: Found ${validResults.length} entries with honorees${RESET}`);
-        console.log(`${GREEN}Total: ${existing.length} results, ${processedUrls.size} URLs processed${RESET}`);
+        console.log(`${GREEN}\nBatch ${batchNum}: Found ${ehrungen.length} entries with honorees${RESET}`);
+        console.log(`${GREEN}Total: ${existing.length} URLs processed${RESET}`);
         
         console.log('\n' + '='.repeat(80) + '\n');
     }
