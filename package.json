@@ -1,0 +1,8 @@
+{
+  "name": "kaernten-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "node-html-parser": "^6.1.13"
+  }
+}
